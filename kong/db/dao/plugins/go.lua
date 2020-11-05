@@ -498,7 +498,7 @@ local get_plugin do
         plugin[phase] = function(self, conf)
           local serialize_data = kong.log.serialize()
 
-          ngx_timer_at(0, function()
+          kong.async:run(function()
             local co = coroutine.running()
             preloaded_stuff[co] = serialize_data
 
