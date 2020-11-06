@@ -27,6 +27,7 @@ local function setup_it_block()
       },
       async = {
         run = function(...) end,
+        every = function(...) end,
       },
       response = {
         exit = function() end,

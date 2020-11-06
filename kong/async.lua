@@ -6,12 +6,15 @@ local kong = kong
 local math = math
 local pcall = pcall
 local table = table
+local string = string
 local select = select
 local unpack = unpack
 local setmetatable = setmetatable
 
 
-local THREAD_COUNT = 100
+local LOG_WAIT = 60
+local THREAD_COUNT = 100 -- if changed, the code below need to be changed too
+local BUCKET_SIZE = 1000
 local QUEUE_SIZE = 100000
 
 
@@ -42,25 +45,34 @@ local function thread(self, index)
     elseif err ~= "timeout" then
       kong.log.err("async thread #", index, " wait error: ", err)
     end
-
-    local time = ngx.time()
-    if time - self.time >= 60 then
-      self.time = time
-      if self.pending <= 100 then
-        kong.log.debug(self.pending, " async jobs pending and ", self.running, " async jobs running")
-      elseif self.pending <= 1000 then
-        kong.log.info(self.pending, " async jobs pending and ", self.running, " async jobs running")
-      elseif self.pending <= 10000 then
-        kong.log.notice(self.pending, " async jobs pending and ", self.running, " async jobs running")
-      elseif self.pending <= 100000 then
-        kong.log.warn(self.pending, " async jobs pending and ", self.running, " async jobs running")
-      else
-        kong.log.err(self.pending, " async jobs pending and ", self.running, " async jobs running")
-      end
-    end
   end
 
   return true
+end
+
+
+local function log(self)
+  local waited = 0
+  while not ngx.worker.exiting() do
+    ngx.sleep(1)
+    waited = waited + 1
+    if waited == LOG_WAIT then
+      waited = 0
+      local msg = string.format("async jobs: %u running, %u pending, %u errored, %u refused",
+                                self.running, self.pending, self.errored, self.refused)
+      if self.pending <= 100 then
+        kong.log.debug(msg)
+      elseif self.pending <= 1000 then
+        kong.log.info(msg)
+      elseif self.pending <= 10000 then
+        kong.log.notice(msg)
+      elseif self.pending < 100000 then
+        kong.log.warn(msg)
+      else
+        kong.log.err(msg)
+      end
+    end
+  end
 end
 
 
@@ -75,6 +87,8 @@ local function init_worker(premature, self)
     t[i] = ngx.thread.spawn(thread, self, i)
   end
 
+  t[THREAD_COUNT + 1] = ngx.thread.spawn(log, self)
+
   local ok, err = ngx.thread.wait(t[1],  t[2],  t[3],  t[4],  t[5],  t[6],  t[7],  t[8],  t[9],  t[10],
                                   t[11], t[12], t[13], t[14], t[15], t[16], t[17], t[18], t[19], t[20],
                                   t[21], t[22], t[23], t[24], t[25], t[26], t[27], t[28], t[29], t[30],
@@ -84,13 +98,14 @@ local function init_worker(premature, self)
                                   t[61], t[62], t[63], t[64], t[65], t[66], t[67], t[68], t[69], t[70],
                                   t[71], t[72], t[73], t[74], t[75], t[76], t[77], t[78], t[79], t[80],
                                   t[81], t[82], t[83], t[84], t[85], t[86], t[87], t[88], t[89], t[90],
-                                  t[91], t[92], t[93], t[94], t[95], t[96], t[97], t[98], t[99], t[100])
+                                  t[91], t[92], t[93], t[94], t[95], t[96], t[97], t[98], t[99], t[100],
+                                  t[101])
 
   if not ok then
     kong.log.err("async thread worker error: ", err)
   end
 
-  for i = 1, THREAD_COUNT do
+  for i = 1, THREAD_COUNT + 1 do
     ngx.thread.kill(t[i])
     t[i] = nil
   end
@@ -124,6 +139,30 @@ local function create_job(func, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, ...)
 end
 
 
+local function every(premature, self, delay)
+  if premature then
+    return true
+  end
+
+  local bucket = self.buckets[delay]
+  for i = 1, bucket.head do
+    if self.pending == QUEUE_SIZE then
+      self.refused = self.refused + 1
+      kong.log.err("unable to run bucket (", bucket.delay, ") job: async queue is full")
+      return
+    end
+
+    self.pending = self.pending + 1
+    self.head = self.head == QUEUE_SIZE and 1 or self.head + 1
+    self.jobs[self.head] = bucket.jobs[i]
+    self.data[self.head][1] = ngx.now() * 1000
+    self.work:post()
+  end
+
+  return true
+end
+
+
 local async = {}
 
 
@@ -143,6 +182,7 @@ function async.new()
     jobs = jobs,
     data = data,
     work = semaphore.new(),
+    buckets = {},
     running = 0,
     pending = 0,
     errored = 0,
@@ -150,13 +190,15 @@ function async.new()
     counter = 0,
     head = 0,
     tail = 0,
-    time = ngx.time(),
   }, async)
 end
 
 
 function async:init_worker()
-  return ngx.timer.at(0, init_worker, self)
+  local ok, err = ngx.timer.at(0, init_worker, self)
+  if not ok then
+    return nil, err
+  end
 end
 
 
@@ -171,6 +213,36 @@ function async:run(func, ...)
   self.jobs[self.head] = create_job(func, ...)
   self.data[self.head][1] = ngx.now() * 1000
   self.work:post()
+
+  return true
+end
+
+
+function async:every(delay, func, ...)
+  local bucket = self.buckets[delay]
+  if bucket then
+    if bucket.head == BUCKET_SIZE then
+      self.refused = self.refused + 1
+      return nil, "async bucket (" .. delay .. ") is full"
+    end
+
+  else
+    local ok, err = ngx.timer.every(delay, every, self, delay)
+    if not ok then
+      return nil, err
+    end
+
+    bucket = {
+      jobs = kong.table.new(BUCKET_SIZE, 0),
+      head = 0,
+      delay = delay,
+    }
+
+    self.buckets[delay] = bucket
+  end
+
+  bucket.head = bucket.head + 1
+  bucket.jobs[bucket.head] = create_job(func, ...)
 
   return true
 end

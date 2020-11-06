@@ -30,7 +30,6 @@ local log          = ngx.log
 local exit         = ngx.exit
 local null         = ngx.null
 local header       = ngx.header
-local timer_every  = ngx.timer.every
 local subsystem    = ngx.config.subsystem
 local clear_header = ngx.req.clear_header
 local unpack       = unpack
@@ -963,7 +962,7 @@ return {
       local worker_state_update_frequency = kong.configuration.worker_state_update_frequency or 1
 
       if kong.db.strategy ~= "off" then
-        timer_every(worker_state_update_frequency, function(premature)
+        kong.async:every(worker_state_update_frequency, function(premature)
           if premature then
             return
           end
@@ -978,7 +977,7 @@ return {
           end
         end)
 
-        timer_every(worker_state_update_frequency, function(premature)
+        kong.async:every(worker_state_update_frequency, function(premature)
           if premature then
             return
           end
